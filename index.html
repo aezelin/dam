@@ -1063,18 +1063,30 @@ function initBrandBar() {
     });
     var chev=document.createElement('span'); chev.className='brand-chevron'; chev.textContent='▾';
     head.onclick=function(e){ if(e.target===ck||e.target.tagName==='INPUT') return; row.classList.toggle('open'); };
-    ck.onchange=(function(idx,b){ return function(){
+    ck.onchange=(function(idx,b,r,body){ return function(){
       b.checked=ck.checked;
       if(ck.checked){
         CONFIG.brands.forEach(function(br,i){ br.preview=(i===idx); });
         applyBrandFeatures(b);
-        document.querySelectorAll('.brand-row').forEach(function(r,i){
-          r.classList.toggle('active-preview',i===idx);
+        document.querySelectorAll('.brand-row').forEach(function(row2,i){
+          row2.classList.toggle('active-preview',i===idx);
         });
-        row.classList.add('open');
+        r.classList.add('open');
+      } else {
+        // Décocher tous les thèmes et items
+        (b.themes||[]).forEach(function(theme,ti){
+          var thCkEl=document.getElementById(ckThemeId(idx,ti));
+          if(thCkEl){ thCkEl.checked=false; thCkEl.indeterminate=false; }
+          (theme.items||[]).forEach(function(_,di){
+            var dCkEl=document.getElementById(ckDimId(idx,ti,di));
+            if(dCkEl) dCkEl.checked=false;
+          });
+        });
+        // Fermer l'accordéon
+        r.classList.remove('open');
       }
       updateSummary();
-    };})(bi,brand);
+    };})(bi,brand,row,body);
     head.appendChild(ck); head.appendChild(nm); head.appendChild(pfx); head.appendChild(feats); head.appendChild(chev);
 
     // ── Body = thèmes ─────────────────────────────────────
@@ -1218,8 +1230,94 @@ function updateSummary() {
   else{out.style.color='var(--sec)';out.innerHTML=files.map(function(f){return '<div>'+f+'</div>';}).join('');}
 }
 
+// ── Générateur ZIP pur JS (sans dépendance externe) ──────
+// Implémentation minimale : stockage non compressé (Stored, method 0)
+// Suffisant pour des images déjà compressées (JPG, WebP, AVIF, PNG)
+var zipAccum = []; // { filename, blob } accumulés pendant la queue
+
+function u8(n){ return n & 0xff; }
+function u16le(n){ return [n&0xff,(n>>8)&0xff]; }
+function u32le(n){ return [n&0xff,(n>>8)&0xff,(n>>16)&0xff,(n>>24)&0xff]; }
+
+function crc32(buf){
+  var tbl = crc32.t;
+  if(!tbl){ tbl=crc32.t=[]; for(var i=0;i<256;i++){ var c=i; for(var j=0;j<8;j++) c=c&1?(0xedb88320^(c>>>1)):c>>>1; tbl[i]=c>>>0; } }
+  var crc=0xffffffff;
+  for(var k=0;k<buf.length;k++) crc=(tbl[(crc^buf[k])&0xff]^(crc>>>8))>>>0;
+  return (crc^0xffffffff)>>>0;
+}
+
+function buildZip(entries, done){
+  // entries = [{name:string, data:Uint8Array}]
+  // Construit le ZIP en mémoire puis appelle done(blob)
+  var localHeaders=[], centralDir=[], offset=0;
+  var now=new Date();
+  var dosDate=(((now.getFullYear()-1980)&0x7f)<<9)|((now.getMonth()+1)<<5)|now.getDate();
+  var dosTime=(now.getHours()<<11)|(now.getMinutes()<<5)|(now.getSeconds()>>1);
+
+  entries.forEach(function(e){
+    var nameBytes=new TextEncoder().encode(e.name);
+    var crc=crc32(e.data);
+    var sz=e.data.length;
+    // Local file header
+    var lh=[0x50,0x4b,0x03,0x04,20,0,0,0,0,0]
+      .concat(u16le(dosTime)).concat(u16le(dosDate))
+      .concat(u32le(crc)).concat(u32le(sz)).concat(u32le(sz))
+      .concat(u16le(nameBytes.length)).concat(u16le(0));
+    var lhArr=new Uint8Array(lh.length+nameBytes.length+sz);
+    lhArr.set(lh); lhArr.set(nameBytes,lh.length); lhArr.set(e.data,lh.length+nameBytes.length);
+    localHeaders.push(lhArr);
+    // Central directory entry
+    var cd=[0x50,0x4b,0x01,0x02,20,0,20,0,0,0,0,0]
+      .concat(u16le(dosTime)).concat(u16le(dosDate))
+      .concat(u32le(crc)).concat(u32le(sz)).concat(u32le(sz))
+      .concat(u16le(nameBytes.length)).concat(u16le(0)).concat(u16le(0))
+      .concat(u16le(0)).concat(u16le(0)).concat(u32le(0)).concat(u32le(offset));
+    var cdArr=new Uint8Array(cd.length+nameBytes.length);
+    cdArr.set(cd); cdArr.set(nameBytes,cd.length);
+    centralDir.push(cdArr);
+    offset+=lhArr.length;
+  });
+
+  var cdOffset=offset;
+  var cdSize=centralDir.reduce(function(s,a){return s+a.length;},0);
+  var eocd=[0x50,0x4b,0x05,0x06,0,0,0,0]
+    .concat(u16le(entries.length)).concat(u16le(entries.length))
+    .concat(u32le(cdSize)).concat(u32le(cdOffset))
+    .concat(u16le(0));
+  var total=offset+cdSize+eocd.length;
+  var buf=new Uint8Array(total); var pos=0;
+  localHeaders.forEach(function(a){buf.set(a,pos);pos+=a.length;});
+  centralDir.forEach(function(a){buf.set(a,pos);pos+=a.length;});
+  buf.set(new Uint8Array(eocd),pos);
+  done(new Blob([buf],{type:'application/zip'}));
+}
+
+function downloadZip(){
+  if(!zipAccum.length) return;
+  var today=(new Date()).toISOString().slice(0,10);
+  var pending=zipAccum.length, entries=[];
+  zipAccum.forEach(function(item){
+    var reader=new FileReader();
+    reader.onload=function(e){
+      entries.push({name:item.filename, data:new Uint8Array(e.target.result)});
+      if(--pending===0){
+        buildZip(entries, function(zipBlob){
+          var url=URL.createObjectURL(zipBlob);
+          var a=document.createElement('a'); a.href=url;
+          a.download='strip_collage_'+today+'.zip';
+          document.body.appendChild(a); a.click(); document.body.removeChild(a);
+          setTimeout(function(){URL.revokeObjectURL(url);},2000);
+        });
+      }
+    };
+    reader.readAsArrayBuffer(item.blob);
+  });
+}
+
 // ── Export / Queue ────────────────────────────────────────
 function queueExports() {
+  zipAccum = []; // réinitialiser l'accumulation ZIP
   var today=(new Date()).toISOString().slice(0,10).replace(/-/g,'');
   var ml={v:'vertical',h:'horizontal',d:'diagonal'}[S.mode]||S.mode;
   var tpl=document.getElementById('exportName').value.trim()||'visuel';
@@ -1264,7 +1362,14 @@ function updateQueueProgress(done,total) {
 
 function runQueue() {
   if(jobRunning||jobQueue.length===0){
-    if(!jobQueue.length) setTimeout(function(){document.getElementById('queueSection').style.display='none';jobRunning=false;},1500);
+    if(!jobQueue.length){
+      setTimeout(function(){
+        document.getElementById('queueSection').style.display='none';
+        jobRunning=false;
+        // Afficher bouton ZIP dans la galerie
+        if(zipAccum.length>0) showZipButton();
+      },1500);
+    }
     return;
   }
   jobRunning=true;
@@ -1287,9 +1392,9 @@ function runQueue() {
   function onBlob(blob){
     var url=URL.createObjectURL(blob);
     addToGallery(url,job.filename,job.fmt);
-    // Téléchargement navigateur
-    var a=document.createElement('a'); a.href=url; a.download=job.filename;
-    document.body.appendChild(a); a.click(); document.body.removeChild(a);
+    // Accumuler pour le ZIP
+    var zipPath = job.folder ? job.folder+'/'+job.filename : job.filename;
+    zipAccum.push({filename: zipPath, blob: blob});
     // Sauvegarde sur serveur si activée
     if(saveToServer && avifServerOk){
       saveFileToServer(blob, job.filename, job.folder||'', function(){ markDone(); });
@@ -1325,9 +1430,27 @@ function addToGallery(url,filename,fmt) {
   galleryUrls.push(url);
 }
 
+function showZipButton(){
+  var gs=document.getElementById('gallerySection');
+  gs.style.display='flex';
+  // Vérifier si le bouton ZIP existe déjà
+  if(document.getElementById('btnDownloadZip')) return;
+  var btn=document.createElement('button');
+  btn.id='btnDownloadZip';
+  btn.className='btn blue';
+  btn.style.cssText='font-size:11px;align-self:flex-start';
+  btn.textContent='↓ Télécharger tout en ZIP ('+zipAccum.length+' fichiers)';
+  btn.onclick=downloadZip;
+  var hdr=gs.querySelector('.gallery-header');
+  if(hdr) hdr.appendChild(btn);
+}
+
 function clearGallery() {
   galleryUrls.forEach(function(u){URL.revokeObjectURL(u);}); galleryUrls=[];
+  zipAccum=[];
   document.getElementById('galleryGrid').innerHTML='';
+  var zipBtn=document.getElementById('btnDownloadZip');
+  if(zipBtn) zipBtn.remove();
   document.getElementById('gallerySection').style.display='none';
 }
 
@@ -1529,7 +1652,7 @@ var TOUR_STEPS = [
     desc:'Glissez l\'image pour positionner le sujet dans le cadre de recadrage. La grille en tiers aide à composer. Le cadre respecte le ratio des dimensions du document. Cliquez "Valider le recadrage →" pour continuer.' },
   { title:'3 · Choisir une marque', target:'brandBar',
     desc:'Cochez une marque pour l\'activer. Trois effets simultanés : la sidebar affiche les sections disponibles, les miniatures de preview se mettent à jour, et la marque est incluse dans le batch export. Cliquez la ligne pour voir ses dimensions.' },
-  { title:'4 · Configurer les strips', target:'secStrips',
+  { title:'4 · Configurer les strips', target:'secStrips', onEnter:'showStripSection',
     desc:'Pour les marques avec strips actifs (CIC BP, Créatif). Nombre, hauteur %, largeur %, gap et angle (mode diagonal). Le slider "Décalage" crée une alternance ±v/2 sur tous les strips simultanément.' },
   { title:'5 · Color Burn+', target:'secColorBurn',
     desc:'Applique un aplat coloré en mode Color Burn sur un strip ciblé. Cliquez le carré pour choisir la couleur. Opacité 60–80% donne généralement le meilleur rendu. "Strip n° 0" désactive l\'effet.' },
@@ -1639,8 +1762,30 @@ function endTour() {
   document.getElementById('tourHighlight').style.display = 'none';
 }
 
+// ── Actions déclenchées à l'entrée d'une étape ────────────
+var TOUR_ON_ENTER = {
+  showStripSection: function(){
+    // Si secStrips est masqué, trouver la première marque avec strips et la cocher temporairement
+    var sec = document.getElementById('secStrips');
+    if(sec && sec.style.display === 'none'){
+      // Trouver CIC BP ou première marque avec strips
+      var idx = -1;
+      CONFIG.brands.forEach(function(b,i){ if(b.features.strips && idx<0) idx=i; });
+      if(idx>=0){
+        var ckEl = document.getElementById('ckBrand_'+idx);
+        if(ckEl && !ckEl.checked){
+          ckEl.checked = true;
+          ckEl.dispatchEvent(new Event('change'));
+        }
+      }
+    }
+  }
+};
+
 function renderTourStep() {
   var s = TOUR_STEPS[tourStep], n = TOUR_STEPS.length;
+  // Déclencher l'action onEnter si définie
+  if(s.onEnter && TOUR_ON_ENTER[s.onEnter]) TOUR_ON_ENTER[s.onEnter]();
   document.getElementById('tourStepLbl').textContent = 'Étape '+(tourStep+1)+' / '+n;
   document.getElementById('tourTitle').innerHTML = s.title;
   // Description + contenu interactif

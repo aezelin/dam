@@ -1,6 +1,6 @@
 # Strip Collage — Guide d'utilisation
 
-> **Version 2.1** · Export navigateur · JPG · WebP · PNG · AVIF (via serveur Node)
+> **Version 2.1.1** · Export navigateur · JPG · WebP · PNG · AVIF (via serveur Node)
 
 ---
 
