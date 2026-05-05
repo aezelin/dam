@@ -1,0 +1,4 @@
+node_modules/
+exports/
+*.zip
+.DS_Store
